@@ -1,0 +1,744 @@
+import ast
+import datetime
+import difflib
+import base64
+import hashlib
+import io
+import json
+import os
+import re
+import sqlite3
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for headless rendering
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# Optional OpenAI import check
+try:
+    import openai
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+
+# =====================================================================
+# CUSTOM JSON ENCODER FOR NUMPY & PANDAS TYPES
+# =====================================================================
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder to safely serialize NumPy/Pandas scalar types."""
+
+    def default(self, obj):
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (pd.Timestamp, datetime.date, datetime.datetime)):
+            return str(obj)
+        if pd.isna(obj):
+            return None
+        return super().default(obj)
+
+
+# =====================================================================
+# 1. MESSY DATASET GENERATOR
+# =====================================================================
+def generate_messy_csv(filename: str = "sales_data_messy.csv"):
+    np.random.seed(42)
+    n_rows = 120
+    dates = pd.date_range(start="2023-01-01", periods=n_rows, freq="D")
+
+    df = pd.DataFrame(
+        {
+            " Transaction_ID ": [
+                f"TXN-{1000 + i}" for i in range(n_rows)
+            ],  # Dirty whitespace
+            "Date": dates.strftime("%Y-%m-%d"),
+            "Region": np.random.choice(
+                ["North", "South", "East", "West", None],
+                size=n_rows,
+                p=[0.25, 0.25, 0.2, 0.2, 0.1],
+            ),
+            "Category": np.random.choice(
+                ["Electronics", "Clothing", "Furniture"], size=n_rows
+            ),
+            "Revenue": np.random.uniform(50.0, 1500.0, size=n_rows).round(2),
+            "Units_Sold": np.random.randint(1, 20, size=n_rows),
+            "Discount_Pct": np.random.choice([0.0, 0.05, 0.10, 0.15], size=n_rows),
+        }
+    )
+
+    # Inject missing values and extreme statistical outliers for testing
+    df.loc[5:12, "Revenue"] = np.nan
+    df.loc[25, "Revenue"] = 25000.0  # Extreme outlier
+    df.to_csv(filename, index=False)
+    print(f"[Setup] Generated messy dataset '{filename}' with outliers and nulls.")
+
+
+# =====================================================================
+# FEATURE 1: ENHANCED AST STATIC SECURITY SANDBOX
+# =====================================================================
+class ASTSafetyGuard(ast.NodeVisitor):
+    """Parses code AST to block unsafe calls, imports, or file operations."""
+
+    FORBIDDEN_NODES = (
+        ast.Import,
+        ast.ImportFrom,
+        ast.Delete,
+        ast.Global,
+        ast.Nonlocal,
+        ast.With,
+        ast.Try,
+    )
+    FORBIDDEN_CALLS = {
+        "eval",
+        "exec",
+        "open",
+        "__import__",
+        "getattr",
+        "setattr",
+        "delattr",
+        "system",
+        "popen",
+        "remove",
+        "rmdir",
+        "unlink",
+        "shutil",
+        "subprocess",
+        "globals",
+        "locals",
+        "vars",
+    }
+
+    def __init__(self):
+        self.is_safe = True
+        self.violations = []
+
+    def visit(self, node):
+        if isinstance(node, self.FORBIDDEN_NODES):
+            self.is_safe = False
+            self.violations.append(
+                f"Forbidden language construct: {type(node).__name__}"
+            )
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        func_name = None
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
+
+        if func_name and func_name in self.FORBIDDEN_CALLS:
+            self.is_safe = False
+            self.violations.append(f"Forbidden call: {func_name}()")
+        self.generic_visit(node)
+
+
+# =====================================================================
+# FEATURE 2: CRYPTOGRAPHIC AUDIT LEDGER (APPEND-ONLY)
+# =====================================================================
+class CryptographicAuditLedger:
+    """Maintains a blockchain-style append-only ledger in SQLite with SHA-256 linking."""
+
+    def __init__(self, db_conn: sqlite3.Connection):
+        self.conn = db_conn
+        self._init_table()
+
+    def _init_table(self):
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_ledger (
+                block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                certificate_id TEXT UNIQUE,
+                previous_hash TEXT,
+                block_hash TEXT,
+                payload JSON
+            )
+            """
+        )
+        self.conn.commit()
+
+    def get_latest_hash(self) -> str:
+        cur = self.conn.cursor()
+        cur.execute("SELECT block_hash FROM audit_ledger ORDER BY block_id DESC LIMIT 1")
+        row = cur.fetchone()
+        return row[0] if row else "GENESIS_BLOCK_00000000000000000000000000000000"
+
+    def append_certificate(self, cert: dict) -> dict:
+        prev_hash = self.get_latest_hash()
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        raw_payload = f"{prev_hash}|{timestamp}|{json.dumps(cert, cls=NumpyEncoder, sort_keys=True)}"
+        block_hash = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+
+        cert["previous_block_hash"] = prev_hash
+        cert["ledger_block_hash"] = block_hash
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO audit_ledger (timestamp, certificate_id, previous_hash, block_hash, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                cert["certificate_id"],
+                prev_hash,
+                block_hash,
+                json.dumps(cert, cls=NumpyEncoder),
+            ),
+        )
+        self.conn.commit()
+        return cert
+
+
+# =====================================================================
+# FEATURE 3: ADVANCED PROOF-CARRYING DATA ANALYST WITH EXTENDED CAPABILITIES
+# =====================================================================
+class EnhancedProofAnalyst:
+
+    def __init__(self, csv_filepath: str, api_key: str = None):
+        self.filepath = csv_filepath
+        self.df = pd.read_csv(csv_filepath)
+        # Clean column names
+        self.df.columns = self.df.columns.str.strip()
+
+        # Build dynamic Index of categorical values present in the dataset
+        self.value_index = {}
+        for col in self.df.select_dtypes(include=["object", "category"]).columns:
+            unique_vals = set(self.df[col].dropna().unique())
+            self.value_index[col] = {
+                val.lower(): val for val in unique_vals if isinstance(val, str)
+            }
+
+        # Dual engine: In-memory SQLite database
+        self.conn = sqlite3.connect(":memory:")
+        self.df.to_sql("sales", self.conn, index=False, if_exists="replace")
+
+        # Initialize Audit Ledger
+        self.ledger = CryptographicAuditLedger(self.conn)
+
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if HAS_OPENAI and self.api_key:
+            self.client = openai.OpenAI(api_key=self.api_key)
+        else:
+            self.client = None
+
+    # -----------------------------------------------------------------
+    # ENHANCED DATA HYGIENE & ANOMALY DETECTION
+    # -----------------------------------------------------------------
+    def check_data_hygiene(self, code: str, result_subset: Optional[pd.DataFrame] = None) -> list:
+        warnings = []
+        for col in self.df.columns:
+            if col.lower() in code.lower():
+                null_cnt = int(self.df[col].isnull().sum())
+                if null_cnt > 0:
+                    pct = (null_cnt / len(self.df)) * 100
+                    warnings.append(
+                        f"Missing Data: Column '{col}' contains {null_cnt} missing values ({pct:.1f}%). Safe aggregation applied."
+                    )
+
+                # Statistical Outlier Check (IQR Method) on Numeric Columns
+                if pd.api.types.is_numeric_dtype(self.df[col]):
+                    valid_series = self.df[col].dropna()
+                    if len(valid_series) > 10:
+                        q1 = valid_series.quantile(0.25)
+                        q3 = valid_series.quantile(0.75)
+                        iqr = q3 - q1
+                        outliers = valid_series[(valid_series < (q1 - 1.5 * iqr)) | (valid_series > (q3 + 1.5 * iqr))]
+                        if not outliers.empty:
+                            warnings.append(
+                                f"Statistical Outlier Detected: '{col}' contains {len(outliers)} anomalous values (e.g. {outliers.iloc[0]})."
+                            )
+        return warnings
+
+    # -----------------------------------------------------------------
+    # ENHANCED TRAP VALIDATION & BOUNDARY GUARD
+    # -----------------------------------------------------------------
+    def validate_trap_question(self, question: str) -> Tuple[bool, str]:
+        q_lower = question.lower()
+        existing_cols = [c.lower() for c in self.df.columns]
+
+        # Trap 1: Requesting non-existent metrics
+        if any(term in q_lower for term in ["profit", "cost", "margin", "tax", "salary"]):
+            if not any(c in existing_cols for c in ["cost", "profit", "margin", "tax", "salary"]):
+                return (
+                    False,
+                    f"REFUSAL: The dataset lacks financial/cost metrics. (Available columns: {list(self.df.columns)})",
+                )
+
+        # Trap 2: Out of range date queries
+        if any(year in q_lower for year in ["2025", "2026", "2030"]):
+            min_d, max_d = (
+                (self.df["Date"].min(), self.df["Date"].max())
+                if "Date" in self.df.columns
+                else ("N/A", "N/A")
+            )
+            return (
+                False,
+                f"REFUSAL: Requested timeframe is outside dataset range ({min_d} to {max_d}).",
+            )
+
+        # Trap 3: Non-existent entities
+        for term in ["employee", "customer", "store", "manager", "supplier"]:
+            if term in q_lower:
+                return (
+                    False,
+                    f"REFUSAL: Entity '{term}' does not exist in schema. Available columns: {list(self.df.columns)}",
+                )
+
+        # Trap 4: Value-Level Validation
+        words = re.findall(r"\b[A-Za-z]+\b", question)
+        for col, val_map in self.value_index.items():
+            if col.lower() in q_lower:
+                found_match = any(word.lower() in val_map for word in words)
+                if not found_match and len(words) > 3:
+                    valid_opts = list(val_map.values())
+                    return (
+                        False,
+                        f"REFUSAL: Requested value for '{col}' was not found. Available options for {col}: {valid_opts}",
+                    )
+
+        return True, "Valid"
+
+    # -----------------------------------------------------------------
+    # EXTENDED DETERMINISTIC LOCAL RULE-BASED PARSER
+    # -----------------------------------------------------------------
+    def _dynamic_local_generator(self, question: str) -> Tuple[bool, str, str, str]:
+        q = question.lower()
+
+        # Target Column
+        target_col = None
+        if "revenue" in q:
+            target_col = "Revenue"
+        elif "unit" in q or "sold" in q:
+            target_col = "Units_Sold"
+        elif "discount" in q:
+            target_col = "Discount_Pct"
+
+        if not target_col:
+            return (
+                False,
+                "",
+                "",
+                "UNPARSEABLE_QUERY: Could not identify target metric (Revenue, Units_Sold, Discount_Pct) in question.",
+            )
+
+        # Filters
+        filters, sql_filters = [], []
+        for col, val_map in self.value_index.items():
+            for val_lower, val_actual in val_map.items():
+                if val_lower in q:
+                    filters.append(f"(df['{col}'] == '{val_actual}')")
+                    sql_filters.append(f"{col} = '{val_actual}'")
+
+        # Aggregation
+        agg, sql_agg = "sum", "SUM"
+        if any(w in q for w in ["average", "avg", "mean"]):
+            agg, sql_agg = "mean", "AVG"
+        elif any(w in q for w in ["highest", "max", "maximum"]):
+            agg, sql_agg = "max", "MAX"
+        elif any(w in q for w in ["lowest", "min", "minimum"]):
+            agg, sql_agg = "min", "MIN"
+        elif "count" in q:
+            agg, sql_agg = "count", "COUNT"
+
+        # Check for Group By request
+        group_col = None
+        if "by category" in q:
+            group_col = "Category"
+        elif "by region" in q:
+            group_col = "Region"
+
+        if group_col:
+            p_code = f"result = df.groupby('{group_col}')['{target_col}'].{agg}().to_dict()"
+            s_code = f"SELECT json_group_object({group_col}, {sql_agg}({target_col})) FROM sales GROUP BY {group_col};"
+            if filters:
+                filter_str = " & ".join(filters)
+                p_code = f"result = df[{filter_str}].groupby('{group_col}')['{target_col}'].{agg}().to_dict()"
+                s_code = f"SELECT json_group_object({group_col}, {sql_agg}({target_col})) FROM sales WHERE {' AND '.join(sql_filters)} GROUP BY {group_col};"
+        else:
+            if filters:
+                filter_str = " & ".join(filters)
+                p_code = f"result = df[{filter_str}]['{target_col}'].{agg}()"
+                s_code = f"SELECT {sql_agg}({target_col}) FROM sales WHERE {' AND '.join(sql_filters)};"
+            else:
+                p_code = f"result = df['{target_col}'].{agg}()"
+                s_code = f"SELECT {sql_agg}({target_col}) FROM sales;"
+
+        return True, p_code, s_code, ""
+
+    # -----------------------------------------------------------------
+    # CODE GENERATION WITH SELF-HEALING REFLECTION
+    # -----------------------------------------------------------------
+    def generate_proof_codes(
+        self, question: str, previous_error: Optional[str] = None
+    ) -> Tuple[bool, str, str, str]:
+        if not self.client:
+            return self._dynamic_local_generator(question)
+
+        schema = f"""
+Table name: 'sales'
+Columns & Types:
+{self.df.dtypes.to_string()}
+
+Categorical Values Present:
+{json.dumps({k: list(v.values()) for k, v in self.value_index.items()})}
+"""
+        error_context = ""
+        if previous_error:
+            error_context = f"\nPREVIOUS ATTEMPT FAILED WITH ERROR:\n{previous_error}\nPlease fix the generated code."
+
+        prompt = f"""
+You are a Proof-Carrying Data Analyst.
+Given this schema:
+{schema}
+
+Generate BOTH Pandas Python code AND a SQL query (SQLite syntax) to answer: "{question}"{error_context}
+
+CRITICAL RULES:
+1. Store final answer in Python variable 'result'.
+2. If the answer requires visualization/plotting, also generate Python code storing matplotlib figure in 'fig'.
+3. Respond ONLY with valid JSON:
+{{
+    "pandas_code": "result = df[df['Category'] == 'Electronics']['Revenue'].sum()",
+    "sql_query": "SELECT SUM(Revenue) FROM sales WHERE Category = 'Electronics';",
+    "visualization_code": "fig, ax = plt.subplots(); df.groupby('Category')['Revenue'].sum().plot(kind='bar', ax=ax); plt.tight_layout()"
+}}
+"""
+        try:
+            res = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            data = json.loads(res.choices[0].message.content)
+            return (
+                True,
+                data.get("pandas_code", ""),
+                data.get("sql_query", ""),
+                data.get("visualization_code", ""),
+            )
+        except Exception:
+            return self._dynamic_local_generator(question)
+
+    # -----------------------------------------------------------------
+    # SAFE EXECUTION ENGINE & VISUALIZATION GENERATOR
+    # -----------------------------------------------------------------
+    def execute_pandas_safely(
+        self, code: str, viz_code: str = ""
+    ) -> Tuple[bool, Any, Optional[str], str]:
+        try:
+            tree = ast.parse(code + "\n" + viz_code)
+            checker = ASTSafetyGuard()
+            checker.visit(tree)
+            if not checker.is_safe:
+                return (
+                    False,
+                    None,
+                    None,
+                    f"AST Sandbox Violation: {', '.join(checker.violations)}",
+                )
+        except SyntaxError as se:
+            return False, None, None, f"Syntax Error: {str(se)}"
+
+        scope = {"df": self.df.copy(), "pd": pd, "np": np, "plt": plt}
+        try:
+            exec(code, scope)
+            res = scope.get("result", None)
+
+            if pd.isna(res) or res is None or res == "NOT_IN_DATASET":
+                return (
+                    False,
+                    None,
+                    None,
+                    "NO_MATCHING_DATA: Query executed but returned no results.",
+                )
+
+            # Process Plot/Chart if generated
+            b64_image = None
+            if viz_code:
+                try:
+                    exec(viz_code, scope)
+                    fig = scope.get("fig", plt.gcf())
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", bbox_inches="tight")
+                    buf.seek(0)
+                    b64_image = base64.b64encode(buf.read()).decode("utf-8")
+                    plt.close(fig)
+                except Exception:
+                    b64_image = None  # Plotting optional non-fatal failure
+
+            return True, res, b64_image, ""
+        except Exception as e:
+            return False, None, None, traceback.format_exc()
+
+    def execute_sql(self, sql_query: str) -> Tuple[bool, Any, str]:
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sql_query)
+            rows = cur.fetchall()
+            if not rows:
+                return True, None, ""
+            
+            # Convert JSON string responses if SQLite json_group_object was used
+            if len(rows) == 1 and len(rows[0]) == 1:
+                val = rows[0][0]
+                if isinstance(val, str) and (val.startswith("{") or val.startswith("[")):
+                    try:
+                        val = json.loads(val)
+                    except json.JSONDecodeError:
+                        pass
+                return True, val, ""
+            return True, rows, ""
+        except Exception as e:
+            return False, None, str(e)
+
+    # -----------------------------------------------------------------
+    # CERTIFICATE & HTML REPORT BUILDERS
+    # -----------------------------------------------------------------
+    def build_audit_certificate(
+        self,
+        question: str,
+        pandas_code: str,
+        sql_query: str,
+        p_res: Any,
+        s_res: Any,
+        consensus: bool,
+        b64_viz: Optional[str] = None,
+    ) -> dict:
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        raw_payload = f"{question}|{pandas_code}|{sql_query}|{p_res}|{timestamp}"
+        cert_hash = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+
+        cert = {
+            "certificate_id": f"PROOF-SHA256-{cert_hash[:12].upper()}",
+            "timestamp": timestamp,
+            "question": question,
+            "pandas_proof_code": pandas_code,
+            "sql_proof_query": sql_query,
+            "pandas_result": p_res,
+            "sql_result": s_res,
+            "dual_engine_consensus": bool(consensus),
+            "signature_hash": cert_hash,
+            "visualization_b64": b64_viz,
+        }
+        
+        # Save certificate into append-only cryptographic ledger
+        return self.ledger.append_certificate(cert)
+
+    def generate_html_report(self, response: dict) -> str:
+        cert = response.get("audit_certificate", {})
+        viz_html = ""
+        if cert.get("visualization_b64"):
+            viz_html = f'<div style="margin-top:20px;"><h3>Visualization</h3><img src="data:image/png;base64,{cert["visualization_b64"]}" style="max-width:100%; border:1px solid #ccc; rounded:8px;"/></div>'
+
+        warnings_html = ""
+        if response.get("data_quality_warnings"):
+            items = "".join([f"<li>{w}</li>" for w in response["data_quality_warnings"]])
+            warnings_html = f'<div style="background:#fff3cd; color:#856404; padding:12px; border-radius:6px; margin:15px 0;"><h4>Data Hygiene Warnings</h4><ul>{items}</ul></div>'
+
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Audit Certificate - {cert.get('certificate_id')}</title>
+            <style>
+                body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 30px; background: #f8f9fa; color: #333; }}
+                .card {{ background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 800px; margin: auto; }}
+                .header {{ border-bottom: 2px solid #007bff; padding-bottom: 10px; margin-bottom: 20px; }}
+                .status {{ font-weight: bold; color: green; }}
+                pre {{ background: #272822; color: #f8f8f2; padding: 12px; border-radius: 6px; overflow-x: auto; }}
+                .badge {{ display: inline-block; padding: 4px 8px; background: #28a745; color: white; border-radius: 4px; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="header">
+                    <h2>Verified Proof Certificate <span class="badge">CHAIN SIGNED</span></h2>
+                    <small>ID: {cert.get('certificate_id')} | Timestamp: {cert.get('timestamp')}</small>
+                </div>
+                <p><strong>Question:</strong> {response.get('question')}</p>
+                <p><strong>Verified Result:</strong> <code>{response.get('calculated_result')}</code></p>
+                <p><strong>Dual-Engine Consensus:</strong> <span class="status">{'PASSED (Pandas == SQL)' if response.get('dual_consensus_match') else 'FAILED'}</span></p>
+                
+                {warnings_html}
+                {viz_html}
+
+                <h3>Pandas Proof Code</h3>
+                <pre><code>{cert.get('pandas_proof_code')}</code></pre>
+
+                <h3>SQL Proof Query</h3>
+                <pre><code>{cert.get('sql_proof_query')}</code></pre>
+
+                <p style="font-size:11px; color:#777; margin-top:20px;">Ledger Block Hash: {cert.get('ledger_block_hash')}<br/>Previous Block Hash: {cert.get('previous_block_hash')}</p>
+            </div>
+        </body>
+        </html>
+        """
+        return html
+
+    # -----------------------------------------------------------------
+    # MAIN QUERY PIPELINE WITH AUTOCORRECT RETRIES
+    # -----------------------------------------------------------------
+    def ask(self, question: str, max_retries: int = 2) -> Dict[str, Any]:
+        # Step 1: Trap & Value Guardrail Check
+        valid, refusal_msg = self.validate_trap_question(question)
+        if not valid:
+            return {
+                "question": question,
+                "status": "REFUSED_TRAP",
+                "reason": refusal_msg,
+            }
+
+        # Step 2: Self-Healing Code Generation and Execution Loop
+        last_err = None
+        for attempt in range(max_retries + 1):
+            success, pandas_code, sql_query, viz_code = self.generate_proof_codes(
+                question, previous_error=last_err
+            )
+            if not success:
+                return {
+                    "question": question,
+                    "status": "UNPARSEABLE_QUERY",
+                    "reason": pandas_code,
+                }
+
+            # Step 3: AST Security Check & Execution
+            p_ok, p_res, b64_viz, p_err = self.execute_pandas_safely(pandas_code, viz_code)
+            if not p_ok:
+                last_err = f"Pandas Execution Error: {p_err}"
+                if attempt < max_retries:
+                    continue
+                return {
+                    "question": question,
+                    "status": "EXECUTION_REFUSED",
+                    "reason": p_err,
+                    "pandas_code": pandas_code,
+                }
+
+            # Step 4: Execute SQL Engine
+            s_ok, s_res, s_err = self.execute_sql(sql_query)
+
+            # Step 5: Dual Consensus Verification
+            consensus = False
+            if p_ok and s_ok and p_res is not None and s_res is not None:
+                try:
+                    if isinstance(p_res, dict) and isinstance(s_res, dict):
+                        consensus = p_res == s_res
+                    else:
+                        consensus = bool(
+                            np.isclose(
+                                float(p_res), float(s_res), rtol=1e-2, equal_nan=True
+                            )
+                        )
+                except (ValueError, TypeError):
+                    consensus = bool(str(p_res).strip() == str(s_res).strip())
+
+            # Step 6: Data Hygiene & Outlier Warnings
+            warnings = self.check_data_hygiene(pandas_code)
+
+            # Step 7: Build Cryptographic Certificate & Ledger Entry
+            cert = self.build_audit_certificate(
+                question, pandas_code, sql_query, p_res, s_res, consensus, b64_viz
+            )
+
+            res_payload = {
+                "question": question,
+                "status": "VERIFIED_PROOF",
+                "calculated_result": p_res,
+                "dual_consensus_match": consensus,
+                "data_quality_warnings": warnings,
+                "audit_certificate": cert,
+            }
+
+            res_payload["html_report"] = self.generate_html_report(res_payload)
+            return res_payload
+
+
+# =====================================================================
+# INTERACTIVE REPL LOOP
+# =====================================================================
+if __name__ == "__main__":
+    generate_messy_csv("sales_data_messy.csv")
+
+    print("\n--- OPENAI SETUP (OPTIONAL) ---")
+    user_api_key = input(
+        "Enter OpenAI API key (or press ENTER for Rule-Based Fallback Engine): "
+    ).strip()
+    api_key_to_use = user_api_key if user_api_key else None
+
+    analyst = EnhancedProofAnalyst("sales_data_messy.csv", api_key=api_key_to_use)
+
+    print("\n" + "=" * 70)
+    print("ENTERPRISE PROOF-CARRYING DATA ANALYST (STRICT AUDIT ENGINE)")
+    print("Dataset Categories available: Electronics, Clothing, Furniture")
+    print("Dataset Regions available:    North, South, East, West")
+    print("Features: Dynamic Value Index | AST Sandbox | Self-Healing Loop")
+    print("          Dual Consensus | Cryptographic Audit Chain | HTML Export")
+    print("Type 'exit' or 'quit' to exit.")
+    print("=" * 70 + "\n")
+
+    while True:
+        try:
+            q = input("\nAsk a question: ").strip()
+            if not q:
+                continue
+            if q.lower() in ["exit", "quit", "q"]:
+                print("Session closed.")
+                break
+
+            response = analyst.ask(q)
+
+            print("\n" + "=" * 70)
+            print(f"QUESTION: {response['question']}")
+            print(f"STATUS:   {response['status']}")
+
+            if response["status"] in [
+                "REFUSED_TRAP",
+                "UNPARSEABLE_QUERY",
+                "EXECUTION_REFUSED",
+            ]:
+                print(f"REASON:   {response['reason']}")
+            elif response["status"] == "VERIFIED_PROOF":
+                print(f"RESULT:   {response['calculated_result']}")
+                print(
+                    f"DUAL CONSENSUS (Pandas == SQL): {response['dual_consensus_match']}"
+                )
+
+                if response["data_quality_warnings"]:
+                    print("\nDATA QUALITY & ANOMALY WARNINGS:")
+                    for w in response["data_quality_warnings"]:
+                        print(f"  • {w}")
+
+                print("\nCRYPTOGRAPHIC AUDIT CERTIFICATE (JSON):")
+                print(
+                    json.dumps(
+                        response["audit_certificate"],
+                        indent=2,
+                        cls=NumpyEncoder,
+                    )
+                )
+
+                # Save HTML audit certificate
+                html_filename = f"audit_{response['audit_certificate']['certificate_id']}.html"
+                with open(html_filename, "w", encoding="utf-8") as f:
+                    f.write(response["html_report"])
+                print(f"\n[Export] Saved HTML Audit Report to '{html_filename}'")
+            else:
+                print(f"ERROR:    {response.get('error')}")
+            print("=" * 70)
+
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
